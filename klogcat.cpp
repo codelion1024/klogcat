@@ -1,7 +1,7 @@
 /*
  * 2017.5.19 initial commit
  * 2017.5.2 use stdout as output if miss '-f'
-
+ * 2017.12.9 limit the max size when redirect output to file
 
 
 usage: /system/bin/klogcat [-f log_path],
@@ -28,10 +28,12 @@ eg:  /system/bin/klogcat -f /data/property/kmsg.log
 #include <cutils/log.h>
 #include <cutils/properties.h>
 
-static const int LOG_NUM = 10;                                  // the max number of log files we want to store.
+static const int LOG_NUM = 10;                          // the max number of log files we want to store.
+static const unsigned long long LOG_SIZE = 83886080;    // the max size of log file we want to store, now is 80MB
 
 void rotate_logs(int max, const char *log_path);
 int read_dev_kmsg(int fd_out);
+const char* log_path;                                   // log_path is meaningful when -f optiob is set
 
 int main(int argc __unused, char **argv __unused)
 {
@@ -41,7 +43,6 @@ int main(int argc __unused, char **argv __unused)
     int opt;
     bool f_flag = false;
     const char* optstr = ":f:";
-    const char* log_path;         // log_path is meaningful when -f optiob is set
 
     while ((opt = getopt(argc, argv, optstr)) != -1) {
         switch (opt) {
@@ -76,16 +77,9 @@ int main(int argc __unused, char **argv __unused)
 }
 
 // Rename last_kmsg -> last_kmsg.1 -> ... -> last_kmsg.$max.
-// Overwrite any existing last_log.$max and last_kmsg.$max.
+// Overwrite any existing last_kmsg.$max.
 void rotate_logs(int max, const char *log_path)
 {
-    // Logs should only be rotated once.
-    static bool rotated = false;
-    if (rotated) {
-        return;
-    }
-    rotated = true;
-
     for (int i = max-1; i >= 0; --i) {
         std::string old_kmsg = android::base::StringPrintf("%s", log_path);
         if (i > 0) {
@@ -105,6 +99,8 @@ void rotate_logs(int max, const char *log_path)
 
 int read_dev_kmsg(int fd_out)
 {
+    unsigned long long bytesWritten = 0;
+
     // Each read returns one message. We block when there are no
     // more messages (--follow);
     int fd = open("/dev/kmsg", O_RDONLY);
@@ -154,16 +150,23 @@ int read_dev_kmsg(int fd_out)
         p = strstr(text, ": ");
         subsystem = p ? (p - text) : 0;
 
-        // print the syslog facility/priority at the start of each line.
-        dprintf(fd_out, "<%d>", facpri);
-        // print timestamps
-        dprintf(fd_out, "[%5lld.%06lld] ", time_us/1000000, time_us%1000000);
+        // print the syslog facility/priority at the start of each line, timestamps
+        bytesWritten += dprintf(fd_out, "<%d>[%5lld.%06lld] ", facpri, time_us/1000000, time_us%1000000);
 
         if (subsystem) {
-            dprintf(fd_out, "%.*s", subsystem, text);
+            bytesWritten += dprintf(fd_out, "%.*s", subsystem, text);
             text += subsystem;
         }
-        dprintf(fd_out, "%s\n", text);
+        bytesWritten += dprintf(fd_out, "%s\n", text);
+        if (fd_out != STDIN_FILENO) {
+            if (bytesWritten >= LOG_SIZE) {
+                fdatasync(fd_out);
+                bytesWritten = 0;
+                close(fd_out);
+                rotate_logs(LOG_NUM, log_path);
+                fd_out = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+            }
+        }
     }
 
     close(fd);
